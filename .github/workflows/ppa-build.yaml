@@ -1,0 +1,337 @@
+name: Build and Upload to Launchpad PPA
+
+# 全域共用環境變數：一般設定集中於 GitHub Variables，敏感值集中於 GitHub Secrets。
+# 各步驟只保留該步驟專屬的動態輸入或輸出。
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO }}
+  PACKAGE_NAME: ${{ vars.PACKAGE_NAME }}
+  PPA_TARGET: ${{ vars.LP_PPA }}
+  ENABLE_UPLOAD: ${{ vars.ENABLE_UPLOAD }}
+  DEBFULLNAME: ${{ vars.DEBFULLNAME }}
+  DEBEMAIL: ${{ vars.DEBEMAIL }}
+  BUILD_DEPENDS: ${{ vars.BUILD_DEPENDS }}
+  BINARY_DEPENDS: ${{ vars.BINARY_DEPENDS }}
+  REV_2204: ${{ vars.REV_2204 }}
+  DPKG_FLAG_2204: ${{ vars.DPKG_FLAG_2204 }}
+  REV_2404: ${{ vars.REV_2404 }}
+  DPKG_FLAG_2404: ${{ vars.DPKG_FLAG_2404 }}
+  REV_2604: ${{ vars.REV_2604 }}
+  DPKG_FLAG_2604: ${{ vars.DPKG_FLAG_2604 }}
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      build_2204:
+        description: '打包 Ubuntu 22.04 (jammy)'
+        required: true
+        type: boolean
+        default: true
+      build_2404:
+        description: '打包 Ubuntu 24.04 (noble)'
+        required: true
+        type: boolean
+        default: true
+      build_2604:
+        description: '打包 Ubuntu 26.04 (resolute)'
+        required: true
+        type: boolean
+        default: true
+      test_upload:
+        description: '僅模擬上傳'
+        required: true
+        type: boolean
+        default: false
+
+# 只需要讀取程式碼；不給多餘權限。
+permissions:
+  contents: read
+
+# 避免排程與手動執行同時跑，造成重複上傳同一版本。
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  check-version:
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 10
+    outputs:
+      needs_update: ${{ steps.check.outputs.needs_update }}
+      upstream_version: ${{ steps.check.outputs.upstream_version }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      release_body_base64: ${{ steps.check.outputs.release_body_base64 }}
+      build_2204: ${{ steps.check.outputs.build_2204 }}
+      build_2404: ${{ steps.check.outputs.build_2404 }}
+      build_2604: ${{ steps.check.outputs.build_2604 }}
+    steps:
+      - name: Check Upstream vs Launchpad API
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 - << 'EOF'
+          import base64
+          import json
+          import os
+          import re
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          def http_json(url, headers=None, retries=3):
+              """GET 並解析 JSON；只對暫時性錯誤（網路、429、5xx）重試。"""
+              last = None
+              for attempt in range(1, retries + 1):
+                  try:
+                      req = urllib.request.Request(url, headers=headers or {})
+                      with urllib.request.urlopen(req, timeout=30) as res:
+                          return json.loads(res.read().decode("utf-8"))
+                  except urllib.error.HTTPError as exc:
+                      if exc.code != 429 and exc.code < 500:
+                          raise
+                      last = exc
+                  except (urllib.error.URLError, TimeoutError) as exc:
+                      last = exc
+                  if attempt < retries:
+                      time.sleep(2 ** attempt)
+              raise last
+
+          upstream_repo = os.environ.get("UPSTREAM_REPO", "").strip()
+          package_name = os.environ.get("PACKAGE_NAME", "").strip()
+          enable_upload = os.environ.get("ENABLE_UPLOAD", "false").strip().lower() == "true"
+          ppa_target = os.environ.get("PPA_TARGET", "").strip()
+          if not upstream_repo or not package_name:
+              raise SystemExit("UPSTREAM_REPO 與 PACKAGE_NAME 必須在 GitHub Variables 設定。")
+
+          # 帶上 token 以避開未驗證請求的低額度（共用 Runner IP 很容易被限流）。
+          gh_headers = {
+              "User-Agent": "GitHub-Actions",
+              "Accept": "application/vnd.github+json",
+              "X-GitHub-Api-Version": "2026-03-10",
+          }
+          if os.environ.get("GITHUB_TOKEN"):
+              gh_headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+          gh_data = http_json(f"https://api.github.com/repos/{upstream_repo}/releases/latest", gh_headers)
+
+          upstream_tag = gh_data["tag_name"].strip()
+          latest_version = re.sub(r"^v(?=\d)", "", upstream_tag)
+          # 輸出值有大小上限，Release 內文過長時截斷（changelog 本來也只需要摘要）。
+          release_body = (gh_data.get("body", "") or "")[:20000]
+
+          # 手動觸發時由 build.py 依 workflow_dispatch 勾選項目決定要打包的系列。
+          event_name = os.environ.get("GITHUB_EVENT_NAME", "")
+          build_flags = {"22.04": True, "24.04": True, "26.04": True}
+          if event_name == "schedule" and enable_upload:
+              if not ppa_target:
+                  raise SystemExit("ENABLE_UPLOAD=true，但未設定 GitHub Variable LP_PPA。為避免誤發布，停止工作。")
+              ppa_clean = ppa_target.removeprefix("ppa:")
+              parts = ppa_clean.split("/")
+              owner = parts[0].lstrip("~")
+              ppa_name = parts[1] if len(parts) > 1 else "ppa"
+              archive_url = f"https://api.launchpad.net/1.0/~{owner}/+archive/ubuntu/{ppa_name}"
+              expected = {
+                  "22.04": f"{latest_version}-{os.environ.get('REV_2204', '').strip() or '0'}~ubuntu22.04",
+                  "24.04": f"{latest_version}-{os.environ.get('REV_2404', '').strip() or '0'}~ubuntu24.04",
+                  "26.04": f"{latest_version}-{os.environ.get('REV_2604', '').strip() or '0'}~ubuntu26.04",
+              }
+              query = urllib.parse.urlencode({
+                  "ws.op": "getPublishedSources",
+                  "source_name": package_name,
+                  "exact_match": "true",
+                  "ws.size": "100",
+              })
+              url = f"{archive_url}?{query}"
+              published = []
+              # 不限定 status：Launchpad 即使版本已被刪除也不允許重傳同一版號。
+              while url:
+                  lp_data = http_json(url, {"User-Agent": "GitHub-Actions"})
+                  published.extend(lp_data.get("entries", []))
+                  url = lp_data.get("next_collection_link")
+              published_versions = {entry.get("source_package_version", "") for entry in published}
+              for ubuntu_version, expected_version in expected.items():
+                  build_flags[ubuntu_version] = expected_version not in published_versions
+                  state = "需要打包" if build_flags[ubuntu_version] else "已存在，跳過"
+                  print(f"Ubuntu {ubuntu_version}: {expected_version} -> {state}")
+          elif event_name == "schedule":
+              print("ENABLE_UPLOAD 不為 true：每日執行打包測試，不查詢/上傳 Launchpad。")
+
+          needs_update = any(build_flags.values())
+          encoded_body = base64.b64encode(release_body.encode("utf-8")).decode("ascii")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"needs_update={'true' if needs_update else 'false'}\n")
+              fh.write(f"upstream_version={latest_version}\n")
+              fh.write(f"upstream_tag={upstream_tag}\n")
+              fh.write(f"release_body_base64={encoded_body}\n")
+              fh.write(f"build_2204={'true' if build_flags['22.04'] else 'false'}\n")
+              fh.write(f"build_2404={'true' if build_flags['24.04'] else 'false'}\n")
+              fh.write(f"build_2604={'true' if build_flags['26.04'] else 'false'}\n")
+          EOF
+
+  build:
+    needs: check-version
+    if: needs.check-version.outputs.needs_update == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+
+      # Source-only 打包（-S -d -nc）不會編譯，因此只裝打包/簽署/上傳工具。
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends dpkg-dev devscripts dput gnupg jq
+
+      - name: Import GPG Key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          # 取主金鑰的完整 fingerprint（fpr 欄位），而不是 key ID。
+          FINGERPRINT=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/ {print $10; exit}')
+          if [ -z "$FINGERPRINT" ]; then
+            echo "::error::匯入後找不到任何 GPG 私鑰，請檢查 GPG_PRIVATE_KEY。" >&2
+            exit 1
+          fi
+          echo "FINGERPRINT=$FINGERPRINT" >> "$GITHUB_ENV"
+
+      - name: Run Build Script
+        env:
+          UPSTREAM_VERSION: ${{ needs.check-version.outputs.upstream_version }}
+          UPSTREAM_TAG: ${{ needs.check-version.outputs.upstream_tag }}
+          RELEASE_BODY_BASE64: ${{ needs.check-version.outputs.release_body_base64 }}
+          GPG_FINGERPRINT: ${{ env.FINGERPRINT }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          AUTO_BUILD_2204: ${{ needs.check-version.outputs.build_2204 }}
+          AUTO_BUILD_2404: ${{ needs.check-version.outputs.build_2404 }}
+          AUTO_BUILD_2604: ${{ needs.check-version.outputs.build_2604 }}
+          EVENT_NAME: ${{ github.event_name }}
+          CHOSEN_2204: ${{ github.event.inputs.build_2204 }}
+          CHOSEN_2404: ${{ github.event.inputs.build_2404 }}
+          CHOSEN_2604: ${{ github.event.inputs.build_2604 }}
+        run: |
+          if [ ! -f scripts/build.py ]; then
+            echo "::error::找不到 scripts/build.py，請確認腳本已提交到儲存庫。" >&2
+            exit 1
+          fi
+          python3 scripts/build.py
+
+      - name: Upload to Launchpad PPA
+        if: vars.ENABLE_UPLOAD == 'true'
+        env:
+          TEST_UPLOAD: ${{ github.event.inputs.test_upload }}
+        run: |
+          set -euo pipefail
+          FLAGS_FILE=build_dir/distro_flags.json
+
+          if [ -z "${PPA_TARGET:-}" ]; then
+            echo "::error::ENABLE_UPLOAD=true，但未設定 GitHub Variable LP_PPA。" >&2
+            exit 1
+          fi
+          if [ ! -f "$FLAGS_FILE" ]; then
+            echo "::error::找不到 $FLAGS_FILE，無法決定上傳順序。" >&2
+            exit 1
+          fi
+
+          DPUT_ARGS=()
+          if [ "${TEST_UPLOAD:-false}" = "true" ]; then
+            DPUT_ARGS+=(--simulate)
+            echo "ℹ️ 模擬上傳模式：dput --simulate（不會真的推送）。"
+          fi
+
+          # 等 Launchpad 接受並發布指定版本（最多 15 分鐘）；逾時只警告，不中斷。
+          wait_published() {
+            local version=$1 deadline=$((SECONDS + 900)) ppa owner name count
+            ppa=${PPA_TARGET#ppa:}; owner=${ppa%%/*}; owner=${owner#\~}; name=${ppa#*/}
+            [ "$name" = "$ppa" ] && name=ppa
+            echo "⏳ 等待 Launchpad 接受 $version（-sa 攜帶的 orig 需先入庫）..."
+            while [ "$SECONDS" -lt "$deadline" ]; do
+              count=$(curl -fsS --get "https://api.launchpad.net/1.0/~${owner}/+archive/ubuntu/${name}" \
+                --data-urlencode "ws.op=getPublishedSources" \
+                --data-urlencode "source_name=${PACKAGE_NAME}" \
+                --data-urlencode "version=${version}" \
+                --data-urlencode "exact_match=true" | jq '.entries | length' || echo 0)
+              if [ "${count:-0}" -gt 0 ]; then echo "✅ $version 已入庫。"; return 0; fi
+              sleep 20
+            done
+            echo "::warning::等待 $version 入庫逾時，仍繼續上傳其餘系列。"
+          }
+
+          # build.py 已把攜帶 orig.tar.gz 的 -sa 系列排在最前面，這裡直接依 JSON 順序上傳。
+          echo "上傳順序：$(jq -r '[.[].codename] | join(" → ")' "$FLAGS_FILE")"
+          echo "-----------------------------------"
+          orig_version=""
+          while IFS=$'\t' read -r codename flag changes version; do
+            if [ ! -f "build_dir/$changes" ]; then
+              echo "::error::找不到 build_dir/$changes（$codename）。" >&2
+              exit 1
+            fi
+            # 前面有 -sa 上傳時，其餘 -sd 系列必須等 orig 入庫後才上傳（模擬模式不等）。
+            if [ "$flag" != "-sa" ] && [ -n "$orig_version" ] && [ "${TEST_UPLOAD:-false}" != "true" ]; then
+              wait_published "$orig_version"
+              orig_version=""
+            fi
+            echo "🚀 [$codename] (Flag: $flag): $changes"
+            dput "${DPUT_ARGS[@]}" "$PPA_TARGET" "build_dir/$changes"
+            [ "$flag" = "-sa" ] && orig_version=$version
+            echo "✅ [$codename] 完成。"
+            echo "-----------------------------------"
+          done < <(jq -r '.[] | [.codename, .dpkg_flag, .changes, .version] | @tsv' "$FLAGS_FILE")
+
+      # 自架 Runner 會保留家目錄；用完就把匯入的私鑰移除。
+      - name: Remove GPG Key
+        if: always() && env.FINGERPRINT != ''
+        run: |
+          gpgconf --kill gpg-agent || true
+          gpg --batch --yes --delete-secret-and-public-key "$FINGERPRINT" || true
+
+  notify:
+    needs: [check-version, build]
+    if: ${{ !cancelled() }}
+    runs-on: ${{ vars.RUNS_ON || 'ubuntu-latest' }}
+    timeout-minutes: 5
+    steps:
+      - name: Send Telegram Notification
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CHECK_STATUS: ${{ needs.check-version.result }}
+          BUILD_STATUS: ${{ needs.build.result }}
+          TEST_UPLOAD: ${{ github.event.inputs.test_upload }}
+          VERSION: ${{ needs.check-version.outputs.upstream_version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            exit 0
+          fi
+
+          VERSION="${VERSION:-未知}"
+          if [ "$CHECK_STATUS" != "success" ]; then
+            STATE=failure
+          elif [ "$BUILD_STATUS" = "success" ]; then
+            STATE=success
+          elif [ "$BUILD_STATUS" = "skipped" ]; then
+            exit 0  # 沒有新版本需要處理
+          else
+            STATE=failure
+          fi
+
+          if [ "$STATE" = "success" ]; then
+            if [ "$ENABLE_UPLOAD" = "true" ] && [ "$TEST_UPLOAD" != "true" ]; then
+              MESSAGE=$(printf '✅ *Launchpad PPA 打包與上傳成功*\n📦 專案: `%s`\n🔖 版本: `%s`\n🚀 已上傳至 Ubuntu PPA。\n🔗 [執行紀錄](%s)' "$PACKAGE_NAME" "$VERSION" "$RUN_URL")
+            else
+              MESSAGE=$(printf '✅ *Launchpad PPA 打包成功*\n📦 專案: `%s`\n🔖 版本: `%s`\n🚀 已成功測試打包及 GPG 簽署（未開啟上傳或僅模擬上傳）！\n🔗 [執行紀錄](%s)' "$PACKAGE_NAME" "$VERSION" "$RUN_URL")
+            fi
+          else
+            MESSAGE=$(printf '❌ *Launchpad PPA 任務失敗*\n📦 專案: `%s`\n🔖 版本: `%s`\n⚠️ 請檢查日誌：[執行紀錄](%s)' "$PACKAGE_NAME" "$VERSION" "$RUN_URL")
+          fi
+
+          curl -sS --fail --retry 3 --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "parse_mode=Markdown" \
+            --data-urlencode "disable_web_page_preview=true" \
+            --data-urlencode "text=${MESSAGE}"
